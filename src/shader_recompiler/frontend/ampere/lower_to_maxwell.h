@@ -36,6 +36,7 @@ struct LoweredProgram {
     u32 required_texture_buffer = ~0U;
     u32 error_offset{};
     std::string_view error;
+    bool dropped_stage_buffer_writes{};
 
     explicit operator bool() const { return error.empty(); }
 };
@@ -230,8 +231,9 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             }
             return reg;
         };
-        const auto operand = [&](u32 which, bool floating = true) -> u32 {
-            const u32 form = insn.Bits(9, 3);
+        const auto operand = [&](u32 which, bool floating = true,
+                                 std::optional<u32> form_override = std::nullopt) -> u32 {
+            const u32 form = form_override.value_or(insn.Bits(9, 3));
             u32 reg{}, kind{}, abs{}, neg{};
             if (which == 0) {
                 reg = insn.Bits(24, 8); abs = insn.Bits(73, 1); neg = insn.Bits(72, 1);
@@ -1712,6 +1714,21 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             }
             break;
         }
+        case 0x598: case 0x599: case 0x59a: case 0x59b: case 0x59c: case 0x59d: case 0x59e:
+        case 0x59f: { // FFMA with register sources (docs/NvidiaGpu.md: FFMA_reg `0101 1001 1--- ----`)
+            // In this family the low three bits of the opcode are the source form selector, not
+            // bits 9-11 like the 0x223/0x423 forms: 0x598 is form 0 and 0x59f is form 7, which is
+            // what operand() has to be told, otherwise it decodes the wrong operand layout.
+            const u32 reg_form = opcode & 0x7;
+            if (insn.Bits(76, 1)) return fail(index, "native FFMA denormal/mode");
+            const u32 a = operand(0, true, reg_form);
+            const u32 b = operand(1, true, reg_form);
+            const u32 c = operand(2, true, reg_form);
+            if (!operand_error.empty()) return fail(index, operand_error);
+            emit(base(0x5980000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) | (u64{c} << 39) |
+                (u64{insn.Bits(77, 1)} << 50) | (u64{insn.Bits(78, 2)} << 51) | (u64{insn.Bits(80, 1)} << 53));
+            break;
+        }
         case 0x223: case 0x423: case 0x623: case 0x823: case 0xa23: case 0xc23: case 0xe23: { // FFMA
             if (insn.Bits(76, 1) || (insn.Bits(81, 11) & ~(opcode == 0xe23 || opcode == 0xc23 ? 0x400U : 0U))) return fail(index, "native FFMA denormal/source mode");
             const u32 a = operand(0), b = operand(1), c = operand(2);
@@ -2251,6 +2268,40 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             main_exited = true;
             break;
         }
+        case 0x923: { // ISBERD: read the internal stage buffer (map, patch, primitive or attribute)
+            // Ampere (Mesa NAK OpIsberd): offset 24-31, imm 40-55, mem_type 74-75 (U8/U16/B32),
+            // access 76-77 (map/patch/prim/attr), skew 78, output 79. The access and mem_type
+            // values match the Maxwell frontend's Mode and SZ.
+            const u32 offset_reg = insn.Bits(24, 8);
+            const u32 imm_offset = insn.Bits(40, 16);
+            const u32 mem_type = insn.Bits(74, 2);
+            const u32 access = insn.Bits(76, 2);
+            const bool skew = insn.Bits(78, 1) != 0;
+            // The Maxwell frontend reads O as a global load, not the output section.
+            if (insn.Bits(79, 1)) return fail(index, "native stage buffer output read");
+            if (mem_type > 2) return fail(index, "native stage buffer entry read size");
+            // Maxwell's imm is bits 24-31 but bit 31 is also skew, and map reads ignore it.
+            if (imm_offset > 0x7f || (access == 0 && imm_offset != 0))
+                return fail(index, "native stage buffer entry read offset");
+            u32 source = offset_reg;
+            if (skew) {
+                // Add the lane offset here (the frontend's skew: 4 bytes a lane, 1 for map reads)
+                // so bit 31 stays clear.
+                emit(0xf0c8000000000000ULL | predicate | 246);                                        // laneid
+                if (access != 0) emit(0x3848000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{2} << 20));
+                if (offset_reg != 255)
+                    emit(0x5c10000000000000ULL | predicate | 246 | (u64{246} << 8) | (u64{offset_reg} << 20));
+                source = 246;
+            }
+            // Maxwell ISBERD: dst 0-7, src 8-15, imm 24-30, mode 33-34, sz 36-39.
+            emit(base(0xefd0000000000000ULL) | (u64{source} << 8) | (u64{imm_offset} << 24) |
+                 (u64{access} << 33) | (u64{mem_type} << 36));
+            break;
+        }
+        case 0x927: // ISBEWR: Maxwell has no stage buffer write; dropping it leaves that output
+                    // stale, where rejecting the program would skip every draw that uses it.
+            result.dropped_stage_buffer_writes = true;
+            break;
         default:
             return fail(index, "unsupported native opcode");
         }
